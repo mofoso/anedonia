@@ -606,7 +606,8 @@ def obter_resumo_hoje(conexao):
         item["horas"].append(hora_curta(linha["feito_em"]))
         if linha["segundos"]:
             item["segundos"] += linha["segundos"]
-    return list(agrupado.values()), len(linhas)
+    resumo = sorted(agrupado.values(), key=lambda item: item["horas"][-1])
+    return resumo, len(linhas)
 
 
 def montar_tela_hoje(resumo, total, mensagem, timer):
