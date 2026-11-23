@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import termios
+import time
+import tty
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
+
+
+DIR_CONFIG = Path.home() / ".config" / "anedonia"
+CAMINHO_BD = DIR_CONFIG / "data.db"
+CONSOLA = Console()
+
+COR_SUCESSO = "green"
+COR_TEMPO = "cyan"
+COR_TIMER = "yellow"
+COR_ERRO = "red"
+COR_DIM = "dim"
+COR_TECLA = "cyan"
+
+
+def agora():
+    return datetime.now().astimezone()
+
+
+def iso_agora():
+    return agora().isoformat(timespec="seconds")
+
+
+def dia_agora():
+    return agora().strftime("%Y-%m-%d")
+
+
+def hora_curta(dt_iso):
+    return datetime.fromisoformat(dt_iso).strftime("%H:%M")
+
+
+def dia_legivel(dia):
+    dt = datetime.strptime(dia, "%Y-%m-%d")
+    nomes = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+    return f"{dt.strftime('%d-%m-%Y')} {nomes[dt.weekday()]}"
+
+
+def periodo_do_horario(dt):
+    hora = dt.hour
+    if 5 <= hora <= 11:
+        return "Manhã"
+    if 12 <= hora <= 17:
+        return "Tarde"
+    if 18 <= hora <= 23:
+        return "Noite"
+    return "Madrugada"
+
+
+def formatar_duracao(segundos):
+    segundos = max(0, int(segundos))
+    horas, resto = divmod(segundos, 3600)
+    minutos, segs = divmod(resto, 60)
+    if horas > 0:
+        return f"{horas}h {minutos:02d}m"
+    if minutos > 0:
+        return f"{minutos}m {segs:02d}s"
+    return f"{segs}s"
+
+
+def formatar_duracao_curta(segundos):
+    segundos = max(0, int(segundos))
+    horas, resto = divmod(segundos, 3600)
+    minutos, _ = divmod(resto, 60)
+    if horas > 0:
+        return f"{horas}h{minutos:02d}m"
+    return f"{max(1, minutos)}m" if segundos >= 60 else f"{segundos}s"
+
+
+def garantir_dir():
+    DIR_CONFIG.mkdir(parents=True, exist_ok=True)
+
+
+def conectar():
+    garantir_dir()
+    conexao = sqlite3.connect(CAMINHO_BD)
+    conexao.row_factory = sqlite3.Row
+    conexao.execute("PRAGMA foreign_keys = ON")
+    return conexao
+
+
+def iniciar_bd(conexao):
+    conexao.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS atividades (
+            id INTEGER PRIMARY KEY,
+            nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            criada_em TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS registros (
+            id INTEGER PRIMARY KEY,
+            atividade_id INTEGER NOT NULL REFERENCES atividades(id),
+            feito_em TEXT NOT NULL,
+            dia TEXT NOT NULL,
+            periodo TEXT NOT NULL,
+            segundos INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS timer_ativo (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            atividade_id INTEGER NOT NULL REFERENCES atividades(id),
+            iniciado_em TEXT NOT NULL
+        );
+        """
+    )
+    conexao.commit()
+
+
+def obter_atividade_por_nome(conexao, nome):
+    return conexao.execute(
+        "SELECT id, nome FROM atividades WHERE nome = ? COLLATE NOCASE",
+        (nome.strip(),),
+    ).fetchone()
+
+
+def buscar_atividades_por_parcial(conexao, nome):
+    termo = f"%{nome.strip()}%"
+    return conexao.execute(
+        "SELECT id, nome FROM atividades WHERE nome LIKE ? COLLATE NOCASE ORDER BY nome",
+        (termo,),
+    ).fetchall()
+
+
+def obter_ou_criar_atividade(conexao, nome):
+    nome = nome.strip()
+    existente = obter_atividade_por_nome(conexao, nome)
+    if existente:
+        return existente, False
+    conexao.execute(
+        "INSERT INTO atividades (nome, criada_em) VALUES (?, ?)",
+        (nome, iso_agora()),
+    )
+    conexao.commit()
+    return obter_atividade_por_nome(conexao, nome), True
+
+
+def resolver_atividade(conexao, nome):
+    nome = nome.strip()
+    exata = obter_atividade_por_nome(conexao, nome)
+    if exata:
+        return exata, None
+    candidatas = buscar_atividades_por_parcial(conexao, nome)
+    if len(candidatas) == 1:
+        return candidatas[0], None
+    if len(candidatas) > 1:
+        nomes = ", ".join(c["nome"] for c in candidatas)
+        return None, f'"{nome}" combina com: {nomes}\nSeja mais específico.'
+    return None, None
+
+
+def contar_registros_hoje(conexao, atividade_id):
+    linha = conexao.execute(
+        "SELECT COUNT(*) AS total FROM registros WHERE atividade_id = ? AND dia = ?",
+        (atividade_id, dia_agora()),
+    ).fetchone()
+    return linha["total"]
+
+
+def inserir_registro(conexao, atividade_id, feito_em, segundos=None):
+    dt = datetime.fromisoformat(feito_em)
+    conexao.execute(
+        """
+        INSERT INTO registros (atividade_id, feito_em, dia, periodo, segundos)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (atividade_id, feito_em, dt.strftime("%Y-%m-%d"), periodo_do_horario(dt), segundos),
+    )
+    conexao.commit()
+
+
+def obter_timer_ativo(conexao):
+    return conexao.execute(
+        """
+        SELECT t.atividade_id, t.iniciado_em, a.nome
+        FROM timer_ativo t
+        JOIN atividades a ON a.id = t.atividade_id
+        WHERE t.id = 1
+        """
+    ).fetchone()
+
+
+def definir_timer_ativo(conexao, atividade_id, iniciado_em):
+    conexao.execute("DELETE FROM timer_ativo WHERE id = 1")
+    conexao.execute(
+        "INSERT INTO timer_ativo (id, atividade_id, iniciado_em) VALUES (1, ?, ?)",
+        (atividade_id, iniciado_em),
+    )
+    conexao.commit()
+
+
+def limpar_timer_ativo(conexao):
+    conexao.execute("DELETE FROM timer_ativo WHERE id = 1")
+    conexao.commit()
+
+
+def tocar_som_conclusao():
+    if os.environ.get("ANEDONIA_SOUND", "1") == "0":
+        return
+    caminho = DIR_CONFIG / "som.ogg"
+    if not caminho.exists():
+        return
+    for cmd in (["paplay", str(caminho)], ["pw-play", str(caminho)], ["aplay", "-q", str(caminho)]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                pass
+
+
+def imprimir_sucesso(msg):
+    CONSOLA.print(f"[{COR_SUCESSO}]✓[/{COR_SUCESSO}] {msg}")
+
+
+def imprimir_erro(msg):
+    CONSOLA.print(f"[{COR_ERRO}]! {msg}[/{COR_ERRO}]")
+
+
+def imprimir_desfazer(msg):
+    CONSOLA.print(f"[{COR_ERRO}]↶ {msg}[/{COR_ERRO}]")
+
+
+def cmd_ajuda(_args=None):
+    CONSOLA.print(
+        "\n".join(
+            [
+                f"[{COR_DIM}]uso:[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia[/{COR_TECLA}]                  [{COR_DIM}]abre a tui de hoje[/{COR_DIM}]",
+                f'  [{COR_TECLA}]anedonia done "nome"[/{COR_TECLA}]      [{COR_DIM}]registra atividade[/{COR_DIM}]',
+                f'  [{COR_TECLA}]anedonia add "nome"[/{COR_TECLA}]       [{COR_DIM}]adiciona atividade[/{COR_DIM}]',
+                f'  [{COR_TECLA}]anedonia start "nome"[/{COR_TECLA}]     [{COR_DIM}]inicia tempo ao vivo[/{COR_DIM}]',
+                f"  [{COR_TECLA}]anedonia stop[/{COR_TECLA}]             [{COR_DIM}]finaliza tempo ativo[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia undo[/{COR_TECLA}]             [{COR_DIM}]desfaz ultimo registro[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia delete[/{COR_TECLA}]           [{COR_DIM}]apaga todos os dados[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia log[/{COR_TECLA}]              [{COR_DIM}]mostra historico[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia log compact[/{COR_TECLA}]      [{COR_DIM}]historico compacto[/{COR_DIM}]",
+                f"  [{COR_TECLA}]anedonia help[/{COR_TECLA}]             [{COR_DIM}]mostra esta ajuda[/{COR_DIM}]",
+                "",
+                f"[{COR_DIM}]tui:[/{COR_DIM}]",
+                f"  [{COR_TECLA}]a[/{COR_TECLA}] [{COR_DIM}]nova[/{COR_DIM}]  [{COR_TECLA}]t[/{COR_TECLA}] [{COR_DIM}]tempo[/{COR_DIM}]  [{COR_TECLA}]u[/{COR_TECLA}] [{COR_DIM}]desfazer[/{COR_DIM}]  [{COR_TECLA}]h[/{COR_TECLA}] [{COR_DIM}]historico[/{COR_DIM}]  [{COR_TECLA}]q[/{COR_TECLA}] [{COR_DIM}]sair[/{COR_DIM}]",
+                "",
+                f"[{COR_DIM}]tempo:[/{COR_DIM}]",
+                f"  [{COR_TECLA}]Enter[/{COR_TECLA}] [{COR_DIM}]finalizar[/{COR_DIM}]  [{COR_TECLA}]d[/{COR_TECLA}] [{COR_DIM}]descartar[/{COR_DIM}]",
+                "",
+                f"[{COR_DIM}]dep:[/{COR_DIM}]",
+                f"  [{COR_TECLA}]python-rich[/{COR_TECLA}]",
+            ]
+        )
+    )
+
+
+def cmd_add(args):
+    nome = " ".join(args.nome).strip()
+    if not nome:
+        imprimir_erro("Informe o nome da atividade.")
+        return 1
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        _, criada = obter_ou_criar_atividade(conexao, nome)
+        if criada:
+            CONSOLA.print(f"[{COR_SUCESSO}]+[/{COR_SUCESSO}] {nome} adicionada")
+        else:
+            CONSOLA.print(f"[{COR_DIM}]= {nome} já existe[/{COR_DIM}]")
+    return 0
+
+
+def registrar_atividade(conexao, nome, segundos=None):
+    atividade, _ = obter_ou_criar_atividade(conexao, nome)
+    feito_em = iso_agora()
+    inserir_registro(conexao, atividade["id"], feito_em, segundos=segundos)
+    total = contar_registros_hoje(conexao, atividade["id"])
+    return atividade["nome"], feito_em, total
+
+
+def cmd_done(args):
+    nome = " ".join(args.nome).strip()
+    if not nome:
+        imprimir_erro("Informe o nome da atividade.")
+        return 1
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        atividade, erro = resolver_atividade(conexao, nome)
+        if erro:
+            imprimir_erro(erro)
+            return 1
+        nome_final = atividade["nome"] if atividade else nome
+        nome_final, feito_em, total = registrar_atividade(conexao, nome_final)
+        sufixo = f"  ({total}x hoje)" if total > 1 else ""
+        imprimir_sucesso(f"{nome_final} · [{COR_TEMPO}]{hora_curta(feito_em)}[/{COR_TEMPO}]{sufixo}")
+        tocar_som_conclusao()
+    return 0
+
+
+def cmd_stop(_args):
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        timer = obter_timer_ativo(conexao)
+        if not timer:
+            CONSOLA.print(f"[{COR_DIM}]Nenhum tempo ativo.[/{COR_DIM}]")
+            return 0
+        inicio = datetime.fromisoformat(timer["iniciado_em"])
+        fim = agora()
+        segundos = max(0, int((fim - inicio).total_seconds()))
+        inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segundos)
+        limpar_timer_ativo(conexao)
+        imprimir_sucesso(
+            f"{timer['nome']} · [{COR_TEMPO}]{formatar_duracao(segundos)}[/{COR_TEMPO}]  "
+            f"[{COR_DIM}]({inicio.strftime('%H:%M')}–{fim.strftime('%H:%M')})[/{COR_DIM}]"
+        )
+        tocar_som_conclusao()
+    return 0
+
+
+def cmd_undo(_args):
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        linha = conexao.execute(
+            """
+            SELECT r.id, r.feito_em, a.nome
+            FROM registros r
+            JOIN atividades a ON a.id = r.atividade_id
+            ORDER BY r.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not linha:
+            CONSOLA.print(f"[{COR_DIM}]Nada para desfazer.[/{COR_DIM}]")
+            return 0
+        conexao.execute("DELETE FROM registros WHERE id = ?", (linha["id"],))
+        conexao.commit()
+        imprimir_desfazer(f"Desfeito: {linha['nome']} · {hora_curta(linha['feito_em'])}")
+    return 0
+
+
+def cmd_delete(_args):
+    if not CAMINHO_BD.exists():
+        CONSOLA.print(f"[{COR_DIM}]Nenhum dado para apagar.[/{COR_DIM}]")
+        return 0
+    CONSOLA.print(f"[{COR_ERRO}]apagar todos os dados?[/{COR_ERRO}] [{COR_DIM}](s/n)[/{COR_DIM}] ", end="")
+    try:
+        resposta = input().strip().lower()
+    except Exception:
+        resposta = ""
+    if resposta != "s":
+        CONSOLA.print(f"[{COR_DIM}]Cancelado.[/{COR_DIM}]")
+        return 0
+    try:
+        CAMINHO_BD.unlink()
+        imprimir_sucesso("Dados apagados.")
+    except Exception:
+        imprimir_erro("Não foi possível apagar os dados.")
+        return 1
+    return 0
+
+
+def obter_registros_por_dia(conexao):
+    return conexao.execute(
+        """
+        SELECT r.feito_em, r.dia, r.periodo, r.segundos, a.nome
+        FROM registros r
+        JOIN atividades a ON a.id = r.atividade_id
+        ORDER BY r.dia DESC, r.feito_em ASC, r.id ASC
+        """
+    ).fetchall()
+
+
+def cmd_log(args):
+    compacto = len(args.modo) > 0 and args.modo[0] == "compact"
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        linhas = obter_registros_por_dia(conexao)
+        if not linhas:
+            CONSOLA.print(f"[{COR_DIM}]Nenhum registro ainda.[/{COR_DIM}]")
+            CONSOLA.print(f'[{COR_DIM}]Use: anedonia done "Banho"[/{COR_DIM}]')
+            return 0
+
+        dias = {}
+        for linha in linhas:
+            dias.setdefault(linha["dia"], []).append(linha)
+
+        if compacto:
+            for dia, regs in dias.items():
+                dt = datetime.strptime(dia, "%Y-%m-%d")
+                nome_dia = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"][dt.weekday()]
+                CONSOLA.print(f"[bold]{dt.strftime('%d-%m-%Y')} {nome_dia}[/bold]")
+                agrupado = {}
+                for r in regs:
+                    agrupado.setdefault(r["nome"], []).append(r)
+                for nome, itens in agrupado.items():
+                    horas = ", ".join(hora_curta(i["feito_em"]) for i in itens)
+                    duracao = sum(i["segundos"] for i in itens if i["segundos"])
+                    info_duracao = f" [{COR_TEMPO}]{formatar_duracao_curta(duracao)}[/{COR_TEMPO}]" if duracao else ""
+                    CONSOLA.print(
+                        f"  [{COR_SUCESSO}]✓[/{COR_SUCESSO}] {nome} ×{len(itens)}   [{COR_DIM}]{horas}[/{COR_DIM}]{info_duracao}"
+                    )
+                CONSOLA.print("")
+            return 0
+
+        por_mes = {}
+        for dia, regs in dias.items():
+            mes = f"{dia[5:7]}-{dia[:4]}"
+            por_mes.setdefault(mes, []).append((dia, regs))
+
+        meses = list(por_mes.items())
+        for mi, (mes, dias_mes) in enumerate(meses):
+            eh_ultimo_mes = mi == len(meses) - 1
+            CONSOLA.print(f"[bold]{mes}[/bold]")
+            for di, (dia, regs) in enumerate(dias_mes):
+                eh_ultimo_dia = di == len(dias_mes) - 1
+                galho_dia = "└──" if eh_ultimo_dia else "├──"
+                prefixo_dia = "    " if eh_ultimo_dia else "│   "
+                CONSOLA.print(f"{galho_dia} {dia_legivel(dia)} · [{COR_DIM}]{len(regs)} registros[/{COR_DIM}]")
+                periodos = {}
+                for r in regs:
+                    periodos.setdefault(r["periodo"], []).append(r)
+                itens_periodo = list(periodos.items())
+                for pi, (periodo, itens) in enumerate(itens_periodo):
+                    eh_ultimo_periodo = pi == len(itens_periodo) - 1
+                    galho_periodo = "└──" if eh_ultimo_periodo else "├──"
+                    prefixo_periodo = "    " if eh_ultimo_periodo else "│   "
+                    CONSOLA.print(f"{prefixo_dia}{galho_periodo} {periodo}")
+                    largura_nome = min(max(len(r["nome"]) for r in itens), 24)
+                    linhas_reg = []
+                    for r in itens:
+                        nome = r["nome"]
+                        if len(nome) > largura_nome:
+                            nome = nome[: largura_nome - 1] + "…"
+                        if r["segundos"]:
+                            inicio = datetime.fromisoformat(r["feito_em"]) - timedelta(seconds=r["segundos"])
+                            tempo_txt = f"{inicio.strftime('%H:%M')}–{hora_curta(r['feito_em'])}"
+                            dur_txt = f"({formatar_duracao_curta(r['segundos'])})"
+                        else:
+                            tempo_txt = hora_curta(r["feito_em"])
+                            dur_txt = ""
+                        linhas_reg.append((nome, tempo_txt, dur_txt))
+                    largura_tempo = max(len(t) for _, t, _ in linhas_reg)
+                    for ri, (nome, tempo_txt, dur_txt) in enumerate(linhas_reg):
+                        eh_ultimo_reg = ri == len(linhas_reg) - 1
+                        galho_reg = "└──" if eh_ultimo_reg else "├──"
+                        duracao = f"  [{COR_DIM}]{dur_txt}[/{COR_DIM}]" if dur_txt else ""
+                        CONSOLA.print(
+                            f"{prefixo_dia}{prefixo_periodo}{galho_reg} [{COR_SUCESSO}]✓[/{COR_SUCESSO}] {nome:<{largura_nome}}  [{COR_TEMPO}]{tempo_txt:<{largura_tempo}}[/{COR_TEMPO}]{duracao}"
+                        )
+            if not eh_ultimo_mes:
+                CONSOLA.print("")
+    return 0
+
+
+def ler_tecla(timeout=1.0):
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        pronto, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not pronto:
+            return None
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            pronto2, _, _ = select.select([sys.stdin], [], [], 0.01)
+            if pronto2:
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    mapa = {"A": "cima", "B": "baixo", "C": "direita", "D": "esquerda"}
+                    return mapa.get(ch3, "esc")
+                return "esc"
+            return "esc"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x03":
+            return "ctrl_c"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+
+
+def render_timer(nome, segundos):
+    texto = Text()
+    texto.append("\n  ")
+    texto.append("⏱ ", style=COR_TIMER)
+    texto.append(f"{nome}\n", style="bold")
+    texto.append(f"    {formatar_duracao(segundos)}\n\n", style=COR_TEMPO)
+    texto.append("  ")
+    texto.append("Enter", style=COR_TECLA)
+    texto.append(" finalizar · ", style=COR_DIM)
+    texto.append("d", style=COR_TECLA)
+    texto.append(" descartar", style=COR_DIM)
+    return texto
+
+
+def cmd_start(args):
+    nome = " ".join(args.nome).strip()
+    if not nome:
+        imprimir_erro("Informe o nome da atividade.")
+        return 1
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        timer = obter_timer_ativo(conexao)
+        if timer:
+            inicio = datetime.fromisoformat(timer["iniciado_em"])
+            segundos = int((agora() - inicio).total_seconds())
+            imprimir_erro(
+                f"Tempo ativo: {timer['nome']} ({formatar_duracao(segundos)}). Use anedonia stop."
+            )
+            return 1
+        atividade, _ = obter_ou_criar_atividade(conexao, nome)
+        iniciado_em = iso_agora()
+        definir_timer_ativo(conexao, atividade["id"], iniciado_em)
+
+    nome_atividade = atividade["nome"]
+    inicio_dt = datetime.fromisoformat(iniciado_em)
+    salvo = False
+    descartado = False
+    try:
+        with Live(render_timer(nome_atividade, 0), console=CONSOLA, refresh_per_second=4, transient=True) as live:
+            while True:
+                segundos = max(0, int((agora() - inicio_dt).total_seconds()))
+                live.update(render_timer(nome_atividade, segundos))
+                tecla = ler_tecla(timeout=0.25)
+                if tecla is None:
+                    continue
+                if tecla in ("enter", "q"):
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        timer = obter_timer_ativo(conexao)
+                        if timer:
+                            fim = agora()
+                            segs = max(0, int((fim - inicio_dt).total_seconds()))
+                            inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                            limpar_timer_ativo(conexao)
+                            salvo = (nome_atividade, segs, inicio_dt, fim)
+                    break
+                if tecla == "d":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        limpar_timer_ativo(conexao)
+                    descartado = True
+                    break
+                if tecla == "ctrl_c":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        timer = obter_timer_ativo(conexao)
+                        if timer:
+                            fim = agora()
+                            segs = max(0, int((fim - inicio_dt).total_seconds()))
+                            inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                            limpar_timer_ativo(conexao)
+                            salvo = (nome_atividade, segs, inicio_dt, fim)
+                    break
+    except KeyboardInterrupt:
+        with conectar() as conexao:
+            iniciar_bd(conexao)
+            timer = obter_timer_ativo(conexao)
+            if timer:
+                fim = agora()
+                segs = max(0, int((fim - inicio_dt).total_seconds()))
+                inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                limpar_timer_ativo(conexao)
+                salvo = (nome_atividade, segs, inicio_dt, fim)
+
+    if salvo:
+        nome_s, segs, ini, fim = salvo
+        imprimir_sucesso(
+            f"{nome_s} · [{COR_TEMPO}]{formatar_duracao(segs)}[/{COR_TEMPO}]  "
+            f"[{COR_DIM}]({ini.strftime('%H:%M')}–{fim.strftime('%H:%M')})[/{COR_DIM}]"
+        )
+        tocar_som_conclusao()
+        return 0
+    if descartado:
+        imprimir_desfazer(f"Tempo descartado: {nome_atividade}")
+        return 0
+    return 0
+
+
+def obter_resumo_hoje(conexao):
+    linhas = conexao.execute(
+        """
+        SELECT a.nome, r.feito_em, r.segundos
+        FROM registros r
+        JOIN atividades a ON a.id = r.atividade_id
+        WHERE r.dia = ?
+        ORDER BY r.feito_em ASC, r.id ASC
+        """,
+        (dia_agora(),),
+    ).fetchall()
+    agrupado = {}
+    for linha in linhas:
+        item = agrupado.setdefault(linha["nome"], {"nome": linha["nome"], "horas": [], "segundos": 0})
+        item["horas"].append(hora_curta(linha["feito_em"]))
+        if linha["segundos"]:
+            item["segundos"] += linha["segundos"]
+    return list(agrupado.values()), len(linhas)
+
+
+def montar_tela_hoje(resumo, total, mensagem, timer):
+    dt = agora()
+    nomes = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+    meses = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+    titulo_data = f"{nomes[dt.weekday()]}, {dt.day:02d} {meses[dt.month - 1]} {dt.year}"
+    linhas = []
+    linhas.append(f"  [bold]anedonia[/bold]                         [{COR_DIM}]{titulo_data}[/{COR_DIM}]")
+    linhas.append("")
+    linhas.append(f"  [{COR_DIM}]{total} registros hoje[/{COR_DIM}]")
+    linhas.append("")
+    linhas.append("  [bold]HOJE[/bold]")
+    linhas.append(f"  [{COR_DIM}]──────────────────────────────────────────────────────[/{COR_DIM}]")
+    linhas.append("")
+    if not resumo:
+        linhas.append(f"  [{COR_DIM}]Nada registrado ainda.[/{COR_DIM}]")
+    else:
+        largura_nome = min(max(len(item["nome"]) for item in resumo), 24)
+        linhas_formatadas = []
+        for item in resumo:
+            nome = item["nome"]
+            if len(nome) > largura_nome:
+                nome = nome[: largura_nome - 1] + "…"
+            if len(item["horas"]) > 1:
+                horas = f"último {item['horas'][-1]}"
+            else:
+                horas = item["horas"][0]
+            duracao = formatar_duracao_curta(item["segundos"]) if item["segundos"] else ""
+            linhas_formatadas.append((nome, len(item["horas"]), horas, duracao))
+        largura_horas = max(len(h) for _, _, h, _ in linhas_formatadas)
+        for nome, qtd, horas, duracao in linhas_formatadas:
+            dur_txt = f"  [{COR_TEMPO}]{duracao:>5}[/{COR_TEMPO}]" if duracao else "       "
+            linhas.append(
+                f"  [{COR_SUCESSO}]✓[/{COR_SUCESSO}] {nome:<{largura_nome}}  ×{qtd:<2}  [{COR_DIM}]{horas:<{largura_horas}}[/{COR_DIM}]{dur_txt}"
+            )
+    if timer:
+        inicio = datetime.fromisoformat(timer["iniciado_em"])
+        segs = int((agora() - inicio).total_seconds())
+        linhas.append("")
+        linhas.append(f"  [{COR_TIMER}]⏱[/{COR_TIMER}] {timer['nome']} rodando · [{COR_TEMPO}]{formatar_duracao(segs)}[/{COR_TEMPO}]")
+    if mensagem:
+        linhas.append("")
+        linhas.append(f"  {mensagem}")
+    linhas.append("")
+    linhas.append(f"  [{COR_DIM}]──────────────────────────────────────────────────────[/{COR_DIM}]")
+    linhas.append(
+        f"  [{COR_TECLA}]a[/{COR_TECLA}] [{COR_DIM}]nova[/{COR_DIM}] · "
+        f"[{COR_TECLA}]t[/{COR_TECLA}] [{COR_DIM}]tempo[/{COR_DIM}] · "
+        f"[{COR_TECLA}]u[/{COR_TECLA}] [{COR_DIM}]desfazer[/{COR_DIM}] · "
+        f"[{COR_TECLA}]h[/{COR_TECLA}] [{COR_DIM}]historico[/{COR_DIM}] · "
+        f"[{COR_TECLA}]q[/{COR_TECLA}] [{COR_DIM}]sair[/{COR_DIM}]"
+    )
+    return "\n".join(linhas)
+
+
+def mostrar_historico_tui(live, compacto=False):
+    live.stop()
+    try:
+        with conectar() as conexao:
+            iniciar_bd(conexao)
+            linhas_regs = obter_registros_por_dia(conexao)
+        CONSOLA.clear()
+        if not linhas_regs:
+            CONSOLA.print(f"[{COR_DIM}]Nenhum registro ainda.[/{COR_DIM}]")
+        else:
+            class _Args:
+                modo = ["compact"] if compacto else []
+            cmd_log(_Args())
+        CONSOLA.print(f"\n[{COR_DIM}]──────────────────────────────────────────────────────[/{COR_DIM}]")
+        CONSOLA.print(f"[{COR_TECLA}]Enter[/{COR_TECLA}] [{COR_DIM}]voltar[/{COR_DIM}]", end="")
+        try:
+            input()
+        except Exception:
+            pass
+    finally:
+        CONSOLA.clear()
+        live.start()
+
+
+def pausar_para_input(live, prompt):
+    live.stop()
+    try:
+        CONSOLA.print(prompt, end="")
+        return input().strip()
+    except Exception:
+        return ""
+    finally:
+        CONSOLA.clear()
+        live.start()
+
+
+def cmd_tui(_args=None):
+    mensagem = ""
+    CONSOLA.show_cursor(False)
+    try:
+        with Live(Text.from_markup(""), console=CONSOLA, screen=True, auto_refresh=False) as live:
+            sujo = True
+            while True:
+                with conectar() as conexao:
+                    iniciar_bd(conexao)
+                    resumo, total = obter_resumo_hoje(conexao)
+                    timer = obter_timer_ativo(conexao)
+                if sujo or timer:
+                    live.update(
+                        Text.from_markup(montar_tela_hoje(resumo, total, mensagem, timer)),
+                        refresh=True,
+                    )
+                    sujo = False
+                    mensagem = ""
+                tecla = ler_tecla(timeout=0.5)
+                if tecla is None:
+                    continue
+                if tecla == "q":
+                    return 0
+                if tecla == "a":
+                    nome = pausar_para_input(live, f"\n  [{COR_TECLA}]nome[/{COR_TECLA}] [{COR_DIM}](vazio cancela):[/{COR_DIM}] ")
+                    if nome:
+                        with conectar() as conexao:
+                            iniciar_bd(conexao)
+                            nome_final, feito_em, total_dia = registrar_atividade(conexao, nome)
+                        sufixo = f" ({total_dia}x hoje)" if total_dia > 1 else ""
+                        mensagem = f"[{COR_SUCESSO}]✓[/{COR_SUCESSO}] {nome_final} registrado · [{COR_TEMPO}]{hora_curta(feito_em)}[/{COR_TEMPO}]{sufixo}"
+                        tocar_som_conclusao()
+                    sujo = True
+                    continue
+                if tecla == "u":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        linha = conexao.execute(
+                            """
+                            SELECT r.id, r.feito_em, a.nome
+                            FROM registros r
+                            JOIN atividades a ON a.id = r.atividade_id
+                            ORDER BY r.id DESC LIMIT 1
+                            """
+                        ).fetchone()
+                        if linha:
+                            conexao.execute("DELETE FROM registros WHERE id = ?", (linha["id"],))
+                            conexao.commit()
+                            mensagem = f"[{COR_ERRO}]↶[/{COR_ERRO}] Desfeito: {linha['nome']} · {hora_curta(linha['feito_em'])}"
+                        else:
+                            mensagem = f"[{COR_DIM}]Nada para desfazer.[/{COR_DIM}]"
+                    sujo = True
+                    continue
+                if tecla == "h":
+                    mostrar_historico_tui(live, compacto=False)
+                    sujo = True
+                    continue
+                if tecla == "t":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        timer = obter_timer_ativo(conexao)
+                        if timer:
+                            inicio = datetime.fromisoformat(timer["iniciado_em"])
+                            fim = agora()
+                            segs = max(0, int((fim - inicio).total_seconds()))
+                            inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                            limpar_timer_ativo(conexao)
+                            mensagem = (
+                                f"[{COR_SUCESSO}]✓[/{COR_SUCESSO}] {timer['nome']} · "
+                                f"[{COR_TEMPO}]{formatar_duracao(segs)}[/{COR_TEMPO}]"
+                            )
+                            tocar_som_conclusao()
+                            sujo = True
+                            continue
+                    nome = pausar_para_input(live, f"\n  [{COR_TECLA}]tempo[/{COR_TECLA}] [{COR_DIM}](vazio cancela):[/{COR_DIM}] ")
+                    if nome:
+                        with conectar() as conexao:
+                            iniciar_bd(conexao)
+                            atividade, _ = obter_ou_criar_atividade(conexao, nome)
+                            definir_timer_ativo(conexao, atividade["id"], iso_agora())
+                        live.stop()
+                        try:
+                            resultado = executar_timer_ao_vivo(nome)
+                        finally:
+                            live.start()
+                        if resultado:
+                            mensagem = resultado
+                    sujo = True
+                    continue
+    finally:
+        CONSOLA.show_cursor(True)
+
+
+def executar_timer_ao_vivo(nome_atividade):
+    with conectar() as conexao:
+        iniciar_bd(conexao)
+        timer = obter_timer_ativo(conexao)
+        if not timer:
+            atividade, _ = obter_ou_criar_atividade(conexao, nome_atividade)
+            definir_timer_ativo(conexao, atividade["id"], iso_agora())
+            timer = obter_timer_ativo(conexao)
+        inicio_dt = datetime.fromisoformat(timer["iniciado_em"])
+        nome_atividade = timer["nome"]
+
+    salvo = None
+    descartado = False
+    try:
+        with Live(render_timer(nome_atividade, 0), console=CONSOLA, refresh_per_second=4, transient=True) as live:
+            while True:
+                segundos = max(0, int((agora() - inicio_dt).total_seconds()))
+                live.update(render_timer(nome_atividade, segundos))
+                tecla = ler_tecla(timeout=0.25)
+                if tecla is None:
+                    continue
+                if tecla in ("enter", "q"):
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        timer = obter_timer_ativo(conexao)
+                        if timer:
+                            fim = agora()
+                            segs = max(0, int((fim - inicio_dt).total_seconds()))
+                            inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                            limpar_timer_ativo(conexao)
+                            salvo = (nome_atividade, segs, inicio_dt, fim)
+                    break
+                if tecla == "d":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        limpar_timer_ativo(conexao)
+                    descartado = True
+                    break
+                if tecla == "ctrl_c":
+                    with conectar() as conexao:
+                        iniciar_bd(conexao)
+                        timer = obter_timer_ativo(conexao)
+                        if timer:
+                            fim = agora()
+                            segs = max(0, int((fim - inicio_dt).total_seconds()))
+                            inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                            limpar_timer_ativo(conexao)
+                            salvo = (nome_atividade, segs, inicio_dt, fim)
+                    break
+    except KeyboardInterrupt:
+        with conectar() as conexao:
+            iniciar_bd(conexao)
+            timer = obter_timer_ativo(conexao)
+            if timer:
+                fim = agora()
+                segs = max(0, int((fim - inicio_dt).total_seconds()))
+                inserir_registro(conexao, timer["atividade_id"], fim.isoformat(timespec="seconds"), segundos=segs)
+                limpar_timer_ativo(conexao)
+                salvo = (nome_atividade, segs, inicio_dt, fim)
+
+    if salvo:
+        nome_s, segs, ini, fim = salvo
+        tocar_som_conclusao()
+        return (
+            f"[{COR_SUCESSO}]✓[/{COR_SUCESSO}] {nome_s} · "
+            f"[{COR_TEMPO}]{formatar_duracao(segs)}[/{COR_TEMPO}]  "
+            f"[{COR_DIM}]({ini.strftime('%H:%M')}–{fim.strftime('%H:%M')})[/{COR_DIM}]"
+        )
+    if descartado:
+        return f"[{COR_ERRO}]↶[/{COR_ERRO}] Tempo descartado: {nome_atividade}"
+    return ""
+
+
+def criar_parser():
+    parser = argparse.ArgumentParser(prog="anedonia", add_help=False)
+    sub = parser.add_subparsers(dest="comando")
+    sub.add_parser("help", add_help=False)
+    sub.add_parser("stop", add_help=False)
+    sub.add_parser("undo", add_help=False)
+    sub.add_parser("delete", add_help=False)
+
+    p_add = sub.add_parser("add", add_help=False)
+    p_add.add_argument("nome", nargs="+")
+
+    p_done = sub.add_parser("done", add_help=False)
+    p_done.add_argument("nome", nargs="+")
+
+    p_start = sub.add_parser("start", add_help=False)
+    p_start.add_argument("nome", nargs="+")
+
+    p_log = sub.add_parser("log", add_help=False)
+    p_log.add_argument("modo", nargs="*")
+
+    return parser
+
+
+def main():
+    parser = criar_parser()
+    args = parser.parse_args()
+    comando = args.comando
+
+    if comando is None:
+        return cmd_tui()
+    if comando == "help":
+        return cmd_ajuda()
+    if comando == "add":
+        return cmd_add(args)
+    if comando == "done":
+        return cmd_done(args)
+    if comando == "start":
+        return cmd_start(args)
+    if comando == "stop":
+        return cmd_stop(args)
+    if comando == "undo":
+        return cmd_undo(args)
+    if comando == "delete":
+        return cmd_delete(args)
+    if comando == "log":
+        return cmd_log(args)
+
+    imprimir_erro("Comando inválido. Use: anedonia help")
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        CONSOLA.print("")
+        raise SystemExit(130)
